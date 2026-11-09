@@ -8,7 +8,7 @@ use syn::{
 pub fn publics(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let mut ast = parse_macro_input!(item as DeriveInput);
 
-    // 1. Perform all necessary mutations in an isolated scope
+    // 1. Isolated scope for modifications to prevent borrow conflicts
     let is_enum = match &mut ast.data {
         Data::Struct(data_struct) => {
             for field in &mut data_struct.fields {
@@ -20,8 +20,22 @@ pub fn publics(_attr: TokenStream, item: TokenStream) -> TokenStream {
         Data::Union(_) => unimplemented!("Unions are not supported by #[publics]"),
     };
 
-    // 2. Read-only extraction on the mutated AST
+    // 2. Extract immutable references from the root AST components
     let name = &ast.ident;
+    let attrs = &ast.attrs;
+    let vis = &ast.vis;
+    
+    // Decompose structural generics to safely append our new T0, T1 parameters
+    let generics = &ast.generics;
+    let struct_generic_params = &generics.params; // e.g., 'A, B' or empty
+    let (_, ty_generics, where_clause) = generics.split_for_impl();
+
+    // Determine leading commas dynamically based on whether structural parameters exist
+    let leading_comma = if struct_generic_params.is_empty() {
+        quote! {}
+    } else {
+        quote! { , }
+    };
 
     let expanded = if !is_enum {
         // ==================== STRUCTS HANDLER ====================
@@ -58,20 +72,27 @@ pub fn publics(_attr: TokenStream, item: TokenStream) -> TokenStream {
             quote! { #name ( #(#try_assignments,)* ) }
         };
 
-        quote! {
-            #ast
+        let struct_fields_tokens = &data_struct.fields;
+        let semi_token = if is_named { quote! {} } else { quote! { ; } };
 
-            // Generic TryFrom Implementation handles exact matches AND foreign translations
-            impl<#(#generic_t_idents),*> std::convert::TryFrom<(#(#generic_t_idents,)*)> for #name
+        quote! {
+            // Reconstruct the struct declaration
+            #(#attrs)*
+            #vis struct #name #ty_generics #struct_fields_tokens #semi_token
+
+            // FIX: Mix structural parameters and macro parameters directly inside the impl declaration
+            impl < #struct_generic_params #leading_comma #(#generic_t_idents),* > std::convert::TryFrom<(#(#generic_t_idents),*)> for #name #ty_generics
+            #where_clause
             where
                 #(#tuple_types: std::convert::TryFrom<#generic_t_idents>,)*
             {
                 type Error = &'static str;
-                fn try_from(value: (#(#generic_t_idents,)*)) -> std::result::Result<#name, Self::Error> {
+                fn try_from(value: (#(#generic_t_idents),*)) -> std::result::Result<#name #ty_generics, Self::Error> {
                     std::result::Result::Ok(#instantiation)
                 }
             }
         }
+
     } else {
         // ==================== ENUMS HANDLER ====================
         let data_enum = match &ast.data {
@@ -92,7 +113,6 @@ pub fn publics(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
             let tuple_types: Vec<&syn::Type> = fields.iter().map(|f| &f.ty).collect();
             
-            // Create local temporary variable bindings (v0, v1, v2...) to hold destructuring elements safely
             let temp_idents: Vec<syn::Ident> = fields
                 .iter()
                 .enumerate()
@@ -121,9 +141,9 @@ pub fn publics(_attr: TokenStream, item: TokenStream) -> TokenStream {
                 #[derive(Debug, Clone)]
                 pub struct #marker_ident(pub #(#tuple_types,)*);
 
-                impl std::convert::From<#marker_ident> for #name {
+                // FIX: Support enums carrying structural parameters
+                impl < #struct_generic_params > std::convert::From<#marker_ident> for #name #ty_generics #where_clause {
                     fn from(marker: #marker_ident) -> Self {
-                        // FIX: Explicit positional tuple destructuring pattern match bypasses index extraction issues entirely
                         let #marker_ident(#(#temp_idents,)*) = marker;
                         #variant_instantiation
                     }
@@ -131,8 +151,13 @@ pub fn publics(_attr: TokenStream, item: TokenStream) -> TokenStream {
             });
         }
 
+        let enum_variants_tokens = &data_enum.variants;
+
         quote! {
-            #ast
+            #(#attrs)*
+            #vis enum #name #ty_generics {
+                #enum_variants_tokens
+            }
 
             #(#enum_from_impls)*
         }
